@@ -21,7 +21,7 @@ from .modules.vae import WanVAE
 from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-
+import torch_migraphx
 
 class WanT2V:
 
@@ -81,7 +81,7 @@ class WanT2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        self.model = WanModel.from_pretrained(checkpoint_dir, torch_dtype = torch.float16)
         self.model.eval().requires_grad_(False)
 
         if use_usp:
@@ -106,6 +106,13 @@ class WanT2V:
             self.model.to(self.device)
 
         self.sample_neg_prompt = config.sample_neg_prompt
+
+        options = {}
+        options["deallocate"] = True
+        #options["save_compiled"] = "transformer.migx"
+        #options["load_compiled"] = "transformer.migx"
+        #options["bf16"] = True
+        #self.model = torch.compile(self.model, backend='migraphx', options=options, dynamic=False)
 
     def generate(self,
                  input_prompt,
@@ -185,7 +192,7 @@ class WanT2V:
                 target_shape[1],
                 target_shape[2],
                 target_shape[3],
-                dtype=torch.float32,
+                dtype=torch.float16,
                 device=self.device,
                 generator=seed_g)
         ]
@@ -233,10 +240,15 @@ class WanT2V:
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
+
+                import time
+                t0 = time.perf_counter()
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0]
+                torch.cuda.synchronize()
+                print(f"inference time(s) = {time.perf_counter() - t0:.5f}")
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
