@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import warnings
+import time
 
 warnings.filterwarnings('ignore')
 
@@ -488,4 +489,7 @@ def generate(args):
 
 if __name__ == "__main__":
     args = _parse_args()
+
+    t0 = time.perf_counter()
     generate(args)
+    print(f"generate time(s) = {time.perf_counter() - t0:.3f}")
