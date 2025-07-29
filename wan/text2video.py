@@ -241,14 +241,10 @@ class WanT2V:
 
                 self.model.to(self.device)
 
-                import time
-                t0 = time.perf_counter()
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0]
-                torch.cuda.synchronize()
-                print(f"inference time(s) = {time.perf_counter() - t0:.5f}")
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
@@ -260,6 +256,8 @@ class WanT2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+                if self.rank == 0:
+                    print("")
 
             x0 = latents
             if offload_model:

@@ -328,6 +328,8 @@ class WanI2V:
 
                 x0 = [latent.to(self.device)]
                 del latent_model_input, timestep
+                if self.rank == 0:
+                    print("")
 
             if offload_model:
                 self.model.cpu()
