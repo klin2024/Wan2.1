@@ -125,7 +125,10 @@ class WanT2V:
                 self.model.to(self.device)
         else:
             self.sp_size = 1
+            sess_options = onnxruntime.SessionOptions()
+            # sess_options.enable_profiling = True
             self.model = onnxruntime.InferenceSession("wan_model.onnx",
+                                           sess_options=sess_options,
                                            providers=["DmlExecutionProvider"])
 
         self.sample_neg_prompt = config.sample_neg_prompt
@@ -256,22 +259,20 @@ class WanT2V:
             # sample videos
             latents = noise
 
-            arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
+            arg_c = {'context': context, 'seq_len': torch.tensor([seq_len]).to(self.device)}
+            arg_null = {'context': context_null, 'seq_len': torch.tensor([seq_len]).to(self.device)}
 
-            print(f"context {len(context)}")
-            print(f"context_null {len(context_null)}")
             cond_inputs = {
                 "x" : None,
                 "t" : None,
                 "context" : context[0].to(torch.float32).cpu().numpy(),
-                "seq_len" : np.array([seq_len], dtype=np.int64),
+                "seq_len" : torch.tensor([seq_len]).cpu().numpy(),
             }
             uncond_inputs = {
                 "x" : None,
                 "t" : None,
                 "context" : context_null[0].to(torch.float32).cpu().numpy(),
-                "seq_len" : seq_len,
+                "seq_len" : torch.tensor([seq_len]).cpu().numpy(),
             }
 
             for _, t in enumerate(tqdm(timesteps)):
@@ -300,55 +301,27 @@ class WanT2V:
                         ({
                             "x" : latent_model_input,
                             "t" : timestep,
-                            "context" : context,
-                            "seq_len" : seq_len,
+                            "context" : arg_c["context"],
+                            "seq_len" : arg_c["seq_len"],
                         }),
                         "tmp/model.onnx",
-                        input_names= [
+                        input_names=[
                             "x",
                             "t",
                             "context",
-                            # "seq_len",
+                            "seq_len",
                         ],
-                        output_names= [
+                        output_names=[
                             'output'
                         ],
-                        dynamic_axes= {
+                        dynamic_axes={
                             'x' : {0: 'batch', 1: 'frame_size', 2: 'h', 3 : 'w'},
                             'timestep' : {0 : 'batch'},
-                            'context': {0: 'context_dim0', 1: 'context_dim1'}
+                            'context': {0: 'context_dim0', 1: 'context_dim1'},
+                            "seq_len": {0: "seq_len_dim"},
+                            "output": {0: "dim_0", 1: "dim_1", 2: "dim_2", 3: "dim_3"},
                         },
                     )
-                    # torch.onnx.export(
-                    #     self.model,
-                    #     (latent_model_input,
-                    #        timestep,
-                    #      context,
-                    #        seq_len,
-                    #     ),
-                    #     # ({
-                    #     #     "x" : latent_model_input,
-                    #     #     "t" : timestep,
-                    #     #     "context" : context,
-                    #     #     "seq_len" : seq_len,
-                    #     # }),
-                    #     "tmp/model.onnx",
-                    #     input_names= [
-                    #         "x",
-                    #         "t",
-                    #         "context",
-                    #         "seq_len",
-                    #     ],
-                    #     output_names= [
-                    #         'output'
-                    #     ],
-                    #     # dynamic_shapes= {
-                    #     #     'x' : {0: 'batch', 1: 'frame_size', 2: 'h', 3 : 'w'},
-                    #     #     'timestep' : {0 : 'batch'},
-                    #     #     'context': {0: 'context_dim0', 1: 'context_dim1'}
-                    #     # },
-                    #     dynamo=True
-                    # )
 
                     # load model and enable save_as_external_data
                     model = onnx.load("tmp/model.onnx")
@@ -359,19 +332,18 @@ class WanT2V:
                 
                 else:
                     latent_model_input = latent_model_input[0].cpu().numpy()
-                    print(latent_model_input.shape)
                     timestep           = timestep.cpu().numpy()
                     cond_inputs["x"]   = latent_model_input
                     cond_inputs["t"]   = timestep
                     uncond_inputs["x"] = latent_model_input
                     uncond_inputs["t"] = timestep
             
-                    noise_pred_cond = self.model.run(None, cond_inputs)
+                    noise_pred_cond   = self.model.run(None, cond_inputs)
                     noise_pred_uncond = self.model.run(None, uncond_inputs)
 
-
-                    noise_pred_cond = torch.from_numpy(noise_pred_cond[0])
-                    noise_pred_uncond = torch.from_numpy(noise_pred_uncond[0])
+                    # convert to torch.tensor
+                    noise_pred_cond   = torch.from_numpy(noise_pred_cond[0]).to(self.device)
+                    noise_pred_uncond = torch.from_numpy(noise_pred_uncond[0]).to(self.device)
 
                     
 
@@ -387,7 +359,7 @@ class WanT2V:
                 latents = [temp_x0.squeeze(0)]
 
             x0 = latents
-            if offload_model:
+            if offload_model and isinstance(self.model, onnxruntime.InferenceSession) == False:
                 self.model.cpu()
                 torch.cuda.empty_cache()
             if self.rank == 0:
