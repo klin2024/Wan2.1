@@ -8,7 +8,7 @@ import sys
 import types
 from contextlib import contextmanager
 from functools import partial
-
+import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
@@ -21,10 +21,16 @@ from .modules.vae import WanVAE
 from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+import onnx
+import onnxruntime
 
 
 def is_t5_debug_file_exist():
     return os.path.exists("context.pt") and os.path.exists("context_null.pt")
+
+
+def is_onnx_model_exist():
+    return os.path.exists("wan_model.onnx")
 
 
 
@@ -92,30 +98,35 @@ class WanT2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
-        self.model.eval().requires_grad_(False)
+        if is_onnx_model_exist() == False:
+            logging.info(f"Creating WanModel from {checkpoint_dir}")
+            self.model = WanModel.from_pretrained(checkpoint_dir)
+            self.model.eval().requires_grad_(False)
 
-        if use_usp:
-            from xfuser.core.distributed import \
-                get_sequence_parallel_world_size
+            if use_usp:
+                from xfuser.core.distributed import \
+                    get_sequence_parallel_world_size
 
-            from .distributed.xdit_context_parallel import (usp_attn_forward,
-                                                            usp_dit_forward)
-            for block in self.model.blocks:
-                block.self_attn.forward = types.MethodType(
-                    usp_attn_forward, block.self_attn)
-            self.model.forward = types.MethodType(usp_dit_forward, self.model)
-            self.sp_size = get_sequence_parallel_world_size()
+                from .distributed.xdit_context_parallel import (usp_attn_forward,
+                                                                usp_dit_forward)
+                for block in self.model.blocks:
+                    block.self_attn.forward = types.MethodType(
+                        usp_attn_forward, block.self_attn)
+                self.model.forward = types.MethodType(usp_dit_forward, self.model)
+                self.sp_size = get_sequence_parallel_world_size()
+            else:
+                self.sp_size = 1
+
+            if dist.is_initialized():
+                dist.barrier()
+            if dit_fsdp:
+                self.model = shard_fn(self.model)
+            else:
+                self.model.to(self.device)
         else:
             self.sp_size = 1
-
-        if dist.is_initialized():
-            dist.barrier()
-        if dit_fsdp:
-            self.model = shard_fn(self.model)
-        else:
-            self.model.to(self.device)
+            self.model = onnxruntime.InferenceSession("wan_model.onnx",
+                                           providers=["DmlExecutionProvider"])
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
@@ -216,10 +227,10 @@ class WanT2V:
         def noop_no_sync():
             yield
 
-        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+        # no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
         # evaluation mode
-        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+        with amp.autocast(dtype=self.param_dtype), torch.no_grad():
 
             if sample_solver == 'unipc':
                 sample_scheduler = FlowUniPCMultistepScheduler(
@@ -248,17 +259,121 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
+            print(f"context {len(context)}")
+            print(f"context_null {len(context_null)}")
+            cond_inputs = {
+                "x" : None,
+                "t" : None,
+                "context" : context[0].to(torch.float32).cpu().numpy(),
+                "seq_len" : np.array([seq_len], dtype=np.int64),
+            }
+            uncond_inputs = {
+                "x" : None,
+                "t" : None,
+                "context" : context_null[0].to(torch.float32).cpu().numpy(),
+                "seq_len" : seq_len,
+            }
+
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
 
                 timestep = torch.stack(timestep)
 
-                self.model.to(self.device)
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                if is_onnx_model_exist() == False:
+                    self.model.to(self.device)
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0]
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0]
+
+
+                    # convert context(bf16) to float32
+                    context[0] = context[0].to(torch.float32)
+                    # self.model.patch_embedding = self.model.patch_embedding.to(torch.float16)
+                    # self.model = self.model.to(torch.float16)
+
+                    # export onnx model
+                    os.makedirs("tmp", exist_ok=True) 
+                    torch.onnx.export(
+                        self.model,
+                        ({
+                            "x" : latent_model_input,
+                            "t" : timestep,
+                            "context" : context,
+                            "seq_len" : seq_len,
+                        }),
+                        "tmp/model.onnx",
+                        input_names= [
+                            "x",
+                            "t",
+                            "context",
+                            # "seq_len",
+                        ],
+                        output_names= [
+                            'output'
+                        ],
+                        dynamic_axes= {
+                            'x' : {0: 'batch', 1: 'frame_size', 2: 'h', 3 : 'w'},
+                            'timestep' : {0 : 'batch'},
+                            'context': {0: 'context_dim0', 1: 'context_dim1'}
+                        },
+                    )
+                    # torch.onnx.export(
+                    #     self.model,
+                    #     (latent_model_input,
+                    #        timestep,
+                    #      context,
+                    #        seq_len,
+                    #     ),
+                    #     # ({
+                    #     #     "x" : latent_model_input,
+                    #     #     "t" : timestep,
+                    #     #     "context" : context,
+                    #     #     "seq_len" : seq_len,
+                    #     # }),
+                    #     "tmp/model.onnx",
+                    #     input_names= [
+                    #         "x",
+                    #         "t",
+                    #         "context",
+                    #         "seq_len",
+                    #     ],
+                    #     output_names= [
+                    #         'output'
+                    #     ],
+                    #     # dynamic_shapes= {
+                    #     #     'x' : {0: 'batch', 1: 'frame_size', 2: 'h', 3 : 'w'},
+                    #     #     'timestep' : {0 : 'batch'},
+                    #     #     'context': {0: 'context_dim0', 1: 'context_dim1'}
+                    #     # },
+                    #     dynamo=True
+                    # )
+
+                    # load model and enable save_as_external_data
+                    model = onnx.load("tmp/model.onnx")
+                    onnx.save(model, "wan_model.onnx", save_as_external_data=True, location="wan_model.onnx.bin")
+
+                    print("Onnx model export successfully!!  Rerun the command again.!!")
+                    exit()
+                
+                else:
+                    latent_model_input = latent_model_input[0].cpu().numpy()
+                    print(latent_model_input.shape)
+                    timestep           = timestep.cpu().numpy()
+                    cond_inputs["x"]   = latent_model_input
+                    cond_inputs["t"]   = timestep
+                    uncond_inputs["x"] = latent_model_input
+                    uncond_inputs["t"] = timestep
+            
+                    noise_pred_cond = self.model.run(None, cond_inputs)
+                    noise_pred_uncond = self.model.run(None, uncond_inputs)
+
+
+                    noise_pred_cond = torch.from_numpy(noise_pred_cond[0])
+                    noise_pred_uncond = torch.from_numpy(noise_pred_uncond[0])
+
+                    
 
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)

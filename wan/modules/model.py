@@ -18,7 +18,8 @@ def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64).to(device)
+    # position = position.type(torch.float64).to(device)
+    position = position.type(torch.float32).to(device)
 
     # calculation
     sinusoid = torch.outer(
@@ -41,7 +42,8 @@ def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
         torch.arange(max_seq_len),
-        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim))
+        # 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim))
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim))
     )
 
     # Get the real and imaginary parts
@@ -86,7 +88,8 @@ def rope_apply(x, grid_sizes,
         seq_len = f * h * w
 
         # Efficient reshaping
-        x_i = x[i, :seq_len].to(torch.float64).reshape(seq_len, n, c, 2)
+        # x_i = x[i, :seq_len].to(torch.float64).reshape(seq_len, n, c, 2)
+        x_i = x[i, :seq_len].to(torch.float32).reshape(seq_len, n, c, 2)
         x_real = x_i[..., 0]
         x_imag = x_i[..., 1]
 
