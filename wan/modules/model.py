@@ -7,67 +7,114 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-# from .attention import flash_attention
 from .attention import attention
 
 __all__ = ['WanModel']
 
-T5_CONTEXT_TOKEN_NUMBER = 512
-FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
-
 
 def sinusoidal_embedding_1d(dim, position):
+    device = position.device
+
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    position = position.type(torch.float64).to(device)
 
     # calculation
     sinusoid = torch.outer(
-        position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
+        position, torch.pow(10000, -torch.arange(half, device=device).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 
+
+def generate_freqs_without_polar(freqs):
+    # Step 1: 計算實部和虛部
+    device = freqs.device
+    real = torch.cos(freqs).to(device)  # 實部
+    imag = torch.sin(freqs).to(device)  # 虛部
+
+    # Step 2: 返回實部和虛部的數值
+    return real, imag
 
 @amp.autocast(enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
         torch.arange(max_seq_len),
-        1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
-    freqs = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim))
+    )
 
+    # Get the real and imaginary parts
+    real, imag = generate_freqs_without_polar(freqs)
+
+    # Step 3: Merge real and imaginary parts into a complex tensor of dtype torch.complex128
+    return real, imag
+
+
+    # freqs_complex1 = torch.complex(freqs_real1, freqs_imag1).to(torch.complex128)
+    # freqs_complex2 = torch.complex(freqs_real2, freqs_imag2).to(torch.complex128)
+    # freqs_complex3 = torch.complex(freqs_real3, freqs_imag3).to(torch.complex128)
+
+    # freqs = torch.cat([
+    #     freqs_complex1,
+    #     freqs_complex2,
+    #     freqs_complex3
+    # ],
+    #                        dim=1)
 
 @amp.autocast(enabled=False)
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(x, grid_sizes,
+               freqs_real1, freqs_real2, freqs_real3,
+               freqs_imag1, freqs_imag2, freqs_imag3):
     n, c = x.size(2), x.size(3) // 2
 
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    # Pre-concatenate and split freqs only once
+    full_freqs_real = torch.cat([freqs_real1, freqs_real2, freqs_real3], dim=1)
+    full_freqs_imag = torch.cat([freqs_imag1, freqs_imag2, freqs_imag3], dim=1)
 
-    # loop over samples
+    # Determine sizes for split
+    c1 = c - 2 * (c // 3)
+    c2 = c3 = c // 3
+    split_sizes = [c1, c2, c3]
+
+    freqs_real = torch.split(full_freqs_real, split_sizes, dim=1)
+    freqs_imag = torch.split(full_freqs_imag, split_sizes, dim=1)
+
     output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+
+    for i, (f, h, w) in enumerate(grid_sizes.unbind(0)):
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-                            dim=-1).reshape(seq_len, 1, -1)
+        # Efficient reshaping
+        x_i = x[i, :seq_len].to(torch.float64).reshape(seq_len, n, c, 2)
+        x_real = x_i[..., 0]
+        x_imag = x_i[..., 1]
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        # Generate rotary embeddings
+        def expand_freqs(freqs, size, axis):
+            shape = [1, 1, 1, -1]
+            shape[axis] = size
+            return freqs[:size].reshape(shape).expand(f, h, w, -1)
 
-        # append to collection
-        output.append(x_i)
+        fr = [expand_freqs(freqs_real[j], sz, j) for j, sz in enumerate([f, h, w])]
+        fi = [expand_freqs(freqs_imag[j], sz, j) for j, sz in enumerate([f, h, w])]
+
+        freqs_real_i = torch.cat(fr, dim=-1).reshape(seq_len, 1, -1)
+        freqs_imag_i = torch.cat(fi, dim=-1).reshape(seq_len, 1, -1)
+
+        # Apply rotary embedding
+        out_real = x_real * freqs_real_i - x_imag * freqs_imag_i
+        out_imag = x_real * freqs_imag_i + x_imag * freqs_real_i
+
+        # Recombine to original format
+        out = torch.stack([out_real, out_imag], dim=-1).reshape(seq_len, n, -1)
+
+        # Concatenate any remaining sequence
+        if seq_len < x.size(1):
+            out = torch.cat([out, x[i, seq_len:]], dim=0)
+
+        output.append(out)
+
     return torch.stack(output).float()
 
 
@@ -128,7 +175,12 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs_real1,
+        freqs_real2,
+        freqs_real3,
+        freqs_imag1,
+        freqs_imag2,
+        freqs_imag3,):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -148,8 +200,18 @@ class WanSelfAttention(nn.Module):
         q, k, v = qkv_fn(x)
 
         x = attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+            q=rope_apply(q, grid_sizes, freqs_real1,
+                                        freqs_real2,
+                                        freqs_real3,
+                                        freqs_imag1,
+                                        freqs_imag2,
+                                        freqs_imag3),
+            k=rope_apply(k, grid_sizes, freqs_real1,
+                                        freqs_real2,
+                                        freqs_real3,
+                                        freqs_imag1,
+                                        freqs_imag2,
+                                        freqs_imag3,),
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
@@ -207,9 +269,8 @@ class WanI2VCrossAttention(WanSelfAttention):
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
-        context_img = context[:, :image_context_length]
-        context = context[:, image_context_length:]
+        context_img = context[:, :257]
+        context = context[:, 257:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
@@ -274,7 +335,7 @@ class WanAttentionBlock(nn.Module):
             nn.Linear(ffn_dim, dim))
 
         # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
     def forward(
         self,
@@ -282,7 +343,12 @@ class WanAttentionBlock(nn.Module):
         e,
         seq_lens,
         grid_sizes,
-        freqs,
+        freqs_real1,
+        freqs_real2,
+        freqs_real3,
+        freqs_imag1,
+        freqs_imag2,
+        freqs_imag3,
         context,
         context_lens,
     ):
@@ -299,10 +365,17 @@ class WanAttentionBlock(nn.Module):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
+
+
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+            freqs_real1,
+            freqs_real2,
+            freqs_real3,
+            freqs_imag1,
+            freqs_imag2,
+            freqs_imag3,)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
@@ -333,7 +406,7 @@ class Head(nn.Module):
         self.head = nn.Linear(dim, out_dim)
 
         # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim ** 0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, e):
         r"""
@@ -350,21 +423,15 @@ class Head(nn.Module):
 
 class MLPProj(torch.nn.Module):
 
-    def __init__(self, in_dim, out_dim, flf_pos_emb=False):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
 
         self.proj = torch.nn.Sequential(
             torch.nn.LayerNorm(in_dim), torch.nn.Linear(in_dim, in_dim),
             torch.nn.GELU(), torch.nn.Linear(in_dim, out_dim),
             torch.nn.LayerNorm(out_dim))
-        if flf_pos_emb:  # NOTE: we only use this for `flf2v`
-            self.emb_pos = nn.Parameter(torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
 
     def forward(self, image_embeds):
-        if hasattr(self, 'emb_pos'):
-            bs, n, d = image_embeds.shape
-            image_embeds = image_embeds.view(-1, 2 * n, d)
-            image_embeds = image_embeds + self.emb_pos
         clip_extra_context_tokens = self.proj(image_embeds)
         return clip_extra_context_tokens
 
@@ -401,7 +468,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         Args:
             model_type (`str`, *optional*, defaults to 't2v'):
-                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video) or 'flf2v' (first-last-frame-to-video)
+                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
             patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
                 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
             text_len (`int`, *optional*, defaults to 512):
@@ -434,7 +501,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         super().__init__()
 
-        assert model_type in ['t2v', 'i2v', 'flf2v']
+        assert model_type in ['t2v', 'i2v']
         self.model_type = model_type
 
         self.patch_size = patch_size
@@ -477,15 +544,19 @@ class WanModel(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-                               dim=1)
+        # self.freqs = torch.cat([
+        #     rope_params(1024, d - 4 * (d // 6)),
+        #     rope_params(1024, 2 * (d // 6)),
+        #     rope_params(1024, 2 * (d // 6))
+        # ],
+        #                        dim=1)
+        self.freqs_real1, self.freqs_imag1 = rope_params(1024, d - 4 * (d // 6))
+        self.freqs_real2, self.freqs_imag2 = rope_params(1024, 2 * (d // 6))
+        self.freqs_real3, self.freqs_imag3 = rope_params(1024, 2 * (d // 6))
 
-        if model_type == 'i2v' or model_type == 'flf2v':
-            self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == 'flf2v')
+
+        if model_type == 'i2v':
+            self.img_emb = MLPProj(1280, dim)
 
         # initialize weights
         self.init_weights()
@@ -512,7 +583,7 @@ class WanModel(ModelMixin, ConfigMixin):
             seq_len (`int`):
                 Maximum sequence length for positional encoding
             clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode or first-last-frame-to-video mode
+                CLIP image features for image-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
 
@@ -520,12 +591,19 @@ class WanModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
-        if self.model_type == 'i2v' or self.model_type == 'flf2v':
+        if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+
+        print("Use complex workaround model")
+
+        self.freqs_real1 = self.freqs_real1.to(device)
+        self.freqs_real2 = self.freqs_real2.to(device)
+        self.freqs_real3 = self.freqs_real3.to(device)
+        self.freqs_imag1 = self.freqs_imag1.to(device)
+        self.freqs_imag2 = self.freqs_imag2.to(device)
+        self.freqs_imag3 = self.freqs_imag3.to(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -559,7 +637,7 @@ class WanModel(ModelMixin, ConfigMixin):
             ]))
 
         if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
         # arguments
@@ -567,7 +645,12 @@ class WanModel(ModelMixin, ConfigMixin):
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.freqs,
+            freqs_real1 = self.freqs_real1,
+            freqs_real2 = self.freqs_real2,
+            freqs_real3 = self.freqs_real3,
+            freqs_imag1 = self.freqs_imag1,
+            freqs_imag2 = self.freqs_imag2,
+            freqs_imag3 = self.freqs_imag3,
             context=context,
             context_lens=context_lens)
 
