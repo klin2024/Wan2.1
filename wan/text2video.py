@@ -23,6 +23,11 @@ from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
+def is_t5_debug_file_exist():
+    return os.path.exists("context.pt") and os.path.exists("context_null.pt")
+
+
+
 class WanT2V:
 
     def __init__(
@@ -66,13 +71,20 @@ class WanT2V:
         self.param_dtype = config.param_dtype
 
         shard_fn = partial(shard_model, device_id=device_id)
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
+
+        if is_t5_debug_file_exist() == False:
+            self.text_encoder = T5EncoderModel(
+                text_len=config.text_len,
+                dtype=config.t5_dtype,
+                device=torch.device('cpu'),
+                checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
+                tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+                shard_fn=shard_fn if t5_fsdp else None)
+        else:
+            print("!!!!!!!!!!!!!!!!!!!!!!!")
+            print("Miles Debug | Skip load T5 ... Use precomputed T5 data")
+            print("!!!!!!!!!!!!!!!!!!!!!!!")
+
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
@@ -167,17 +179,27 @@ class WanT2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
+        if is_t5_debug_file_exist() == False:
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context = self.text_encoder([input_prompt], self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
+                if offload_model:
+                    self.text_encoder.model.cpu()
+            else:
+                context = self.text_encoder([input_prompt], torch.device('cpu'))
+                context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+                context = [t.to(self.device) for t in context]
+                context_null = [t.to(self.device) for t in context_null]
+            
+            torch.save(context, "context.pt")
+            torch.save(context_null, "context_null.pt")
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            print("!!!!!!!!!!!!!!!!!!!!!!!")
+            print("Miles Debug | Skip T5 ... Use precomputed T5 data")
+            print("!!!!!!!!!!!!!!!!!!!!!!!")
+            context = torch.load("context.pt")
+            context_null = torch.load("context_null.pt")
 
         noise = [
             torch.randn(
